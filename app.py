@@ -40,13 +40,13 @@ def check_password():
     else:
         return True
 
-# --- 🧠 SMART LOGIN FUNCTION ---
-def get_auth_token(student, session):
-    # Option A: If Token is provided in secrets, use it (Fastest)
+# --- 🧠 SMART LOGIN WITH VERIFICATION ---
+def get_auth_token(student, session, headers):
+    # Option A: Manual Token (Always assumes success if present)
     if student.get('token'):
-        return student['token'], "Manual Token"
+        return student['token'], "🔑 Token (Manual)"
     
-    # Option B: If User/Pass is provided, Auto-Login (Best)
+    # Option B: Auto-Login
     if student.get('user') and student.get('pass'):
         login_url = f"{BASE_URL}/api/login"
         payload = {
@@ -55,75 +55,105 @@ def get_auth_token(student, session):
             "user_type": "Student"
         }
         try:
-            # Try Bennett Server Login
-            resp = session.post(login_url, json=payload, timeout=5)
+            # Attempt Login
+            resp = session.post(login_url, json=payload, headers=headers, timeout=5)
+            
+            # 🔍 VERIFY LOGIN STATUS
             if resp.status_code == 200:
                 data = resp.json()
                 token = data.get('data', {}).get('token') or data.get('token')
                 if token:
-                    return token, "Auto-Login"
-            
-            # If failed, try Global Server Login (Backup)
-            resp = session.post("https://api.camu.in/api/login", json=payload, timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                token = data.get('data', {}).get('token')
-                if token:
-                    return token, "Auto-Login (Global)"
+                    return token, "🔓 Login OK (200)"
+                else:
+                    return None, "⚠️ Login OK but NO Token found"
+            else:
+                return None, f"❌ Login Failed ({resp.status_code})"
                     
         except Exception as e:
-            return None, str(e)
+            return None, f"⚠️ Login Error: {str(e)}"
             
-    return None, "No Credentials Found"
+    return None, "❌ No Credentials"
 
-# --- ⚡ PROCESS STUDENT ---
+# --- ⚡ PROCESS WITH FULL LOGS ---
 def process_student(student, qr_code, agent_index):
     start_time = time.time()
     headers = get_headers(agent_index)
     session = requests.Session()
     safe_name = student.get('name', 'Unknown')
     
-    try:
-        # 1. GET TOKEN (Auto or Manual)
-        token, method = get_auth_token(student, session)
-        
-        if not token:
-             return {"success": False, "name": safe_name, "msg": "Login Failed. Check User/Pass."}
-
-        # 2. MARK ATTENDANCE
-        mark_url = f"{BASE_URL}/api/instruction/mark_attendance_qr"
-        auth_headers = headers.copy()
-        auth_headers["Authorization"] = f"Bearer {token}"
-        
-        mark_payload = {
-            "qr_code": qr_code,
-            "latitude": "28.4505", 
-            "longitude": "77.5128"
+    # 1. ATTEMPT LOGIN
+    token, login_status = get_auth_token(student, session, headers)
+    
+    if not token:
+        # ❌ STOP IF LOGIN FAILED
+        return {
+            "success": False, 
+            "name": safe_name, 
+            "step": "Login", 
+            "msg": login_status
         }
-        
-        time.sleep(0.1) # Brief pause
+
+    # 2. MARK ATTENDANCE
+    mark_url = f"{BASE_URL}/api/instruction/mark_attendance_qr"
+    auth_headers = headers.copy()
+    auth_headers["Authorization"] = f"Bearer {token}"
+    
+    mark_payload = {
+        "qr_code": qr_code,
+        "latitude": "28.4505", 
+        "longitude": "77.5128"
+    }
+    
+    try:
+        time.sleep(0.1)
         mark_resp = session.post(mark_url, json=mark_payload, headers=auth_headers, timeout=5)
         duration = round(time.time() - start_time, 2)
         
+        # 3. VERIFY SERVER RESPONSE
+        server_reply = "Unknown"
+        try:
+            # Try to read the exact message from Camu server
+            server_reply = mark_resp.json().get('message', mark_resp.text[:20])
+        except:
+            server_reply = mark_resp.text[:20]
+
         if mark_resp.status_code == 200:
-            return {"success": True, "name": safe_name, "msg": f"MARKED ({method}) in {duration}s", "status": 200}
+            return {
+                "success": True, 
+                "name": safe_name, 
+                "step": "Complete", 
+                "msg": f"{login_status} ➝ 🚀 Sent ➝ ✅ Server Accepted ({duration}s)",
+                "server_reply": server_reply
+            }
         
-        # 404 Fallback
-        if mark_resp.status_code == 404:
+        elif mark_resp.status_code == 404:
+             # Fallback attempt
              fallback_resp = session.post("https://api.camu.in/api/instruction/mark_attendance_qr", json=mark_payload, headers=auth_headers, timeout=5)
              if fallback_resp.status_code == 200:
-                 return {"success": True, "name": safe_name, "msg": f"MARKED (Fallback) in {duration}s", "status": 200}
+                 return {
+                     "success": True, 
+                     "name": safe_name, 
+                     "step": "Fallback", 
+                     "msg": f"{login_status} ➝ ⚠️ 404 ➝ ✅ Fallback Success",
+                     "server_reply": "Saved via Global API"
+                 }
 
-        return {"success": False, "name": safe_name, "msg": f"Failed ({mark_resp.status_code})", "status": mark_resp.status_code}
+        return {
+            "success": False, 
+            "name": safe_name, 
+            "step": "Marking", 
+            "msg": f"{login_status} ➝ ❌ Server Rejected ({mark_resp.status_code})", 
+            "server_reply": server_reply
+        }
 
     except Exception as e:
-        return {"success": False, "name": safe_name, "msg": str(e)}
+        return {"success": False, "name": safe_name, "step": "Error", "msg": str(e)}
 
 # --- 🖥️ UI ---
 if check_password():
-    st.set_page_config(page_title="Bennett Auto-Bot", page_icon="🎓", layout="centered")
-    st.title("🎓 Bennett Auto-Bot")
-    st.caption("Mode: Hybrid (Auto-Login + Token)")
+    st.set_page_config(page_title="Bennett Verifier", page_icon="🕵️", layout="centered")
+    st.title("🕵️ Bennett Attendance Verifier")
+    st.caption("Auto-Login • Server Verification • Live Logs")
 
     tab1, tab2 = st.tabs(["📸 Camera", "📝 Paste"])
     qr_data = None
@@ -145,25 +175,28 @@ if check_password():
             qr_data = qr_text
 
     if qr_data:
-        if st.button("🚀 LAUNCH ATTENDANCE", type="primary", use_container_width=True):
+        if st.button("🚀 VERIFY & MARK", type="primary", use_container_width=True):
             if "squad" not in st.secrets:
                 st.error("Secrets missing.")
                 st.stop()
             
             squad_list = st.secrets["squad"]
             
-            with st.status("🔄 Logging in & Marking...", expanded=True) as status:
-                results = []
-                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                    future_to_student = {
-                        executor.submit(process_student, student, qr_data, i): student 
-                        for i, student in enumerate(squad_list)
-                    }
-                    for future in concurrent.futures.as_completed(future_to_student):
-                        res = future.result()
-                        results.append(res)
-                        if res['success']:
-                            st.write(f"✅ {res['name']}")
-                        else:
-                            st.write(f"❌ {res['name']}")
-                status.update(label="Complete", state="complete", expanded=False)
+            st.divider()
+            st.write("### 📡 Live Verification Logs")
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                future_to_student = {
+                    executor.submit(process_student, student, qr_data, i): student 
+                    for i, student in enumerate(squad_list)
+                }
+                
+                for future in concurrent.futures.as_completed(future_to_student):
+                    res = future.result()
+                    
+                    if res['success']:
+                        st.success(f"**{res['name']}**")
+                        st.code(f"Status: {res['msg']}\nServer Said: \"{res.get('server_reply', 'OK')}\"")
+                    else:
+                        st.error(f"**{res['name']}**")
+                        st.code(f"Failed At: {res.get('step')}\nError: {res['msg']}\nServer Said: \"{res.get('server_reply', 'No Reply')}\"")
