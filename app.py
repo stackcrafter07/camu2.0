@@ -9,22 +9,17 @@ import time
 BASE_URL = "https://student.bennetterp.camu.in"
 # =================================================
 
-def get_headers(user_agent_index, target_host=None):
+def get_headers(user_agent_index):
     agents = [
         "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
         "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Mobile Safari/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
     ]
-    
-    # If we are hitting the Global Server, we must pretend to be on the Global Site
-    origin = "https://www.camu.in" if target_host == "global" else BASE_URL
-    referer = "https://www.camu.in/" if target_host == "global" else f"{BASE_URL}/"
-
     return {
         "User-Agent": agents[user_agent_index % len(agents)],
         "Content-Type": "application/json",
-        "Origin": origin,
-        "Referer": referer
+        "Origin": BASE_URL,
+        "Referer": f"{BASE_URL}/"
     }
 
 def check_password():
@@ -45,8 +40,8 @@ def check_password():
     else:
         return True
 
-# --- 🧠 SMART LOGIN (NOW WITH GLOBAL FALLBACK) ---
-def get_auth_token(student, session, agent_index):
+# --- 🧠 SMART LOGIN (TRYING V2 ENDPOINT) ---
+def get_auth_token(student, session, headers):
     # Option A: Manual Token
     if student.get('token'):
         return student['token'], "🔑 Token (Manual)"
@@ -59,38 +54,36 @@ def get_auth_token(student, session, agent_index):
             "user_type": "Student"
         }
         
-        # 1. Try Bennett Server (Might fail with 404)
+        # 1. Try V2 Endpoint (Most likely for Bennett)
         try:
-            headers = get_headers(agent_index)
-            resp = session.post(f"{BASE_URL}/api/login", json=payload, headers=headers, timeout=5)
+            # Note: Trying /v2/login based on your logs
+            v2_url = f"{BASE_URL}/v2/login" 
+            resp = session.post(v2_url, json=payload, headers=headers, timeout=5)
             if resp.status_code == 200:
                 token = resp.json().get('data', {}).get('token') or resp.json().get('token')
-                if token: return token, "🔓 Login (Bennett)"
+                if token: return token, "🔓 Login (V2)"
         except: pass
 
-        # 2. Try Global Server (The Backdoor)
+        # 2. Try Standard Endpoint (Backup)
         try:
-            # We must change headers to look like we are on camu.in
-            global_headers = get_headers(agent_index, target_host="global")
-            resp = session.post("https://api.camu.in/api/login", json=payload, headers=global_headers, timeout=5)
+            v1_url = f"{BASE_URL}/api/login"
+            resp = session.post(v1_url, json=payload, headers=headers, timeout=5)
             if resp.status_code == 200:
                 token = resp.json().get('data', {}).get('token') or resp.json().get('token')
-                if token: return token, "🔓 Login (Global)"
-            else:
-                return None, f"❌ Global Login Failed ({resp.status_code})"
-        except Exception as e:
-            return None, f"⚠️ Error: {str(e)}"
+                if token: return token, "🔓 Login (V1)"
+        except: pass
             
-    return None, "❌ No Credentials"
+    return None, "❌ Login Failed (Check Pass)"
 
 # --- ⚡ PROCESS STUDENT ---
 def process_student(student, qr_code, agent_index):
     start_time = time.time()
+    headers = get_headers(agent_index)
     session = requests.Session()
     safe_name = student.get('name', 'Unknown')
     
     # 1. LOGIN
-    token, login_status = get_auth_token(student, session, agent_index)
+    token, login_status = get_auth_token(student, session, headers)
     
     if not token:
         return {
@@ -101,10 +94,13 @@ def process_student(student, qr_code, agent_index):
         }
 
     # 2. MARK ATTENDANCE
-    # Bennett URL for marking
-    mark_url = f"{BASE_URL}/api/instruction/mark_attendance_qr"
-    headers = get_headers(agent_index)
-    headers["Authorization"] = f"Bearer {token}"
+    # Bennett V2 URL
+    mark_url = f"{BASE_URL}/v2/instruction/mark_attendance_qr"
+    # Fallback V1 URL
+    mark_url_v1 = f"{BASE_URL}/api/instruction/mark_attendance_qr"
+
+    auth_headers = headers.copy()
+    auth_headers["Authorization"] = f"Bearer {token}"
     
     mark_payload = {
         "qr_code": qr_code,
@@ -114,11 +110,17 @@ def process_student(student, qr_code, agent_index):
     
     try:
         time.sleep(0.1)
-        mark_resp = session.post(mark_url, json=mark_payload, headers=headers, timeout=5)
+        
+        # Try V2 Mark
+        mark_resp = session.post(mark_url, json=mark_payload, headers=auth_headers, timeout=5)
+        
+        # If V2 fails (404), try V1
+        if mark_resp.status_code == 404:
+             mark_resp = session.post(mark_url_v1, json=mark_payload, headers=auth_headers, timeout=5)
+
         duration = round(time.time() - start_time, 2)
         
-        # Server Reply Analysis
-        server_reply = "No Reply"
+        # Read Reply
         try: server_reply = mark_resp.json().get('message', mark_resp.text[:30])
         except: server_reply = mark_resp.text[:30]
 
@@ -131,22 +133,6 @@ def process_student(student, qr_code, agent_index):
                 "server_reply": server_reply
             }
         
-        # 404 Fallback for Marking (Just in case)
-        elif mark_resp.status_code == 404:
-             global_mark_url = "https://api.camu.in/api/instruction/mark_attendance_qr"
-             headers = get_headers(agent_index, target_host="global") # Switch headers
-             headers["Authorization"] = f"Bearer {token}"
-             
-             fallback_resp = session.post(global_mark_url, json=mark_payload, headers=headers, timeout=5)
-             if fallback_resp.status_code == 200:
-                 return {
-                     "success": True, 
-                     "name": safe_name, 
-                     "step": "Fallback", 
-                     "msg": f"{login_status} ➝ ⚠️ 404 ➝ ✅ Global Marked",
-                     "server_reply": "Saved via Global API"
-                 }
-
         return {
             "success": False, 
             "name": safe_name, 
@@ -160,9 +146,9 @@ def process_student(student, qr_code, agent_index):
 
 # --- 🖥️ UI ---
 if check_password():
-    st.set_page_config(page_title="Bennett Verifier", page_icon="🕵️", layout="centered")
-    st.title("🕵️ Bennett Attendance Verifier")
-    st.caption("Auto-Login • Server Verification • Live Logs")
+    st.set_page_config(page_title="Bennett V2 Bot", page_icon="🎓", layout="centered")
+    st.title("🎓 Bennett V2 Bot")
+    st.caption("Auto-Login • V2 API • Live Logs")
 
     tab1, tab2 = st.tabs(["📸 Camera", "📝 Paste"])
     qr_data = None
@@ -184,7 +170,7 @@ if check_password():
             qr_data = qr_text
 
     if qr_data:
-        if st.button("🚀 VERIFY & MARK", type="primary", use_container_width=True):
+        if st.button("🚀 LAUNCH ATTENDANCE", type="primary", use_container_width=True):
             if "squad" not in st.secrets:
                 st.error("Secrets missing.")
                 st.stop()
@@ -192,7 +178,7 @@ if check_password():
             squad_list = st.secrets["squad"]
             
             st.divider()
-            st.write("### 📡 Live Verification Logs")
+            st.write("### 📡 Live Status")
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 future_to_student = {
@@ -204,8 +190,6 @@ if check_password():
                     res = future.result()
                     
                     if res['success']:
-                        st.success(f"**{res['name']}**")
-                        st.code(f"Status: {res['msg']}\nServer Said: \"{res.get('server_reply', 'OK')}\"")
+                        st.success(f"**{res['name']}**\n{res['msg']}")
                     else:
-                        st.error(f"**{res['name']}**")
-                        st.code(f"Failed At: {res.get('step')}\nError: {res['msg']}\nServer Said: \"{res.get('server_reply', 'No Reply')}\"")
+                        st.error(f"**{res['name']}**\nFailed: {res['msg']}\nReply: {res.get('server_reply', '')}")
